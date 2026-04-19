@@ -1,0 +1,46 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+
+# =========================
+# Virtual environment
+# =========================
+venv/
+env/
+.venv/
+
+# =========================
+# Logs (VERY IMPORTANT for Cowrie)
+# =========================
+cowrie/logs/
+*.log
+
+# =========================
+# Large datasets (avoid GitHub limit issues)
+# =========================
+cowrie_raw.json
+*.csv
+*.json
+
+# (optional: keep small datasets manually)
+!dataset_fusionne.csv
+
+# =========================
+# Jupyter notebooks checkpoints
+# =========================
+.ipynb_checkpoints/
+
+# =========================
+# OS files
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# IDE files
+# =========================
+.vscode/
+.idea/

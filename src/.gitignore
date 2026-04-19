@@ -1,0 +1,16 @@
+# virtual environment
+venv/
+
+# python cache
+__pycache__/
+*.pyc
+
+# logs (VERY IMPORTANT for your project)
+cowrie/logs/
+*.log
+
+# large datasets (optional if too big)
+cowrie_raw.json
+
+# system files
+.DS_Store
