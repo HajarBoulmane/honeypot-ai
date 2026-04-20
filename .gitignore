@@ -22,7 +22,7 @@ cowrie/logs/
 # Large datasets (avoid GitHub limit issues)
 # =========================
 cowrie_raw.json
-*.csv
+
 *.json
 
 # (optional: keep small datasets manually)
