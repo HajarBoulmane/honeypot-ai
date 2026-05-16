@@ -1,247 +1,198 @@
-"""
-predict.py — Dionaea
-Polls dionaea-logs from Elasticsearch -> extracts features per source_ip ->
-loads trained model -> predicts -> pushes to dionaea-alerts.
-
-Changes vs original:
-  - Per-IP sliding window buffer (deque maxlen=50)
-  - Poll loop runs in a daemon thread — terminal stays free
-  - SCORE_THRESHOLD overrides model label — tune via env var
-  - Rolling local alert history (last 500) saved to JSONL file
-
-Usage:
-    python src/dionaea/predict.py
-"""
-
 import os
-import json
-import time
-import threading
-import statistics
 import joblib
 import pandas as pd
-from datetime import datetime, timezone
-from collections import defaultdict, deque
-from elasticsearch import Elasticsearch
+import numpy as np
 
-ES_HOST          = os.getenv("ES_HOST",          "http://localhost:9200")
-SOURCE_INDEX     = os.getenv("SOURCE_INDEX",     "dionaea-logs")
-TARGET_INDEX     = os.getenv("TARGET_INDEX",     "dionaea-alerts")
-POLL_SECONDS     = int(os.getenv("POLL_SECONDS",     "5"))
-WINDOW_SIZE      = int(os.getenv("WINDOW_SIZE",      "50"))
-SCORE_THRESHOLD  = float(os.getenv("SCORE_THRESHOLD", "0.64"))
-ALERTS_FILE      = os.getenv("ALERTS_FILE",      "data/dionaea/alerts/alerts.jsonl")
-MAX_ALERTS       = int(os.getenv("MAX_ALERTS",       "500"))
+# PATHS
+FEATURES_CSV = "data/dionaea/processed/dionaea_features.csv"
+OUTPUT_CSV = "data/dionaea/predictions/dionaea_predictions.csv"
 
-MODEL_PATH  = "models/dionaea_model.pkl"
-SCALER_PATH = "models/dionaea_scaler.pkl"
+MODEL_PATH = "models/dionaea/dionaea_model.pkl"
+SCALER_PATH = "models/dionaea/dionaea_scaler.pkl"
+FEAT_COLS_PATH = "models/dionaea/feature_columns.pkl"
+THRESHOLD_PATH = "models/dionaea/anomaly_threshold.txt"
 
-FEATURE_COLS = [
-    "total_uploads",
-    "unique_file_types",
-    "unique_mime_types",
-    "unique_protocols",
-    "unique_signatures",
-    "unique_reporters",
-    "avg_vtpercent",
-    "max_vtpercent",
-    "known_malware",
-    "files_with_hash",
-    "exe_uploads",
-    "jar_uploads",
-    "rar_uploads",
-    "malware_ratio",
-    "hash_ratio",
-    "high_risk_uploads",
-    "suspicious_activity",
-    "exe_ratio",
-    "upload_rate",
-    "burst_score",
-]
-
-print("[*] Loading Dionaea model ...")
-model  = joblib.load(MODEL_PATH)
-scaler = joblib.load(SCALER_PATH)
-print("[OK] Model ready")
-print(f"[*] Score threshold: {SCORE_THRESHOLD}")
-
-es = Elasticsearch(ES_HOST)
-
-# Global state
-last_timestamp: str | None = None
-ip_buffers: dict[str, deque] = defaultdict(lambda: deque(maxlen=WINDOW_SIZE))
-
-# Rolling alert history — load from disk on startup
-os.makedirs(os.path.dirname(ALERTS_FILE), exist_ok=True)
-alert_history: deque = deque(maxlen=MAX_ALERTS)
-if os.path.exists(ALERTS_FILE):
-    with open(ALERTS_FILE) as f:
-        for line in f:
-            try:
-                alert_history.append(json.loads(line))
-            except Exception:
-                pass
-    print(f"[*] Loaded {len(alert_history)} existing alerts from {ALERTS_FILE}")
+os.makedirs("data/dionaea/predictions", exist_ok=True)
 
 
-def save_alert(alert: dict):
-    """Append alert to in-memory deque and rewrite JSONL file."""
-    alert_history.append(alert)
-    with open(ALERTS_FILE, "w") as f:
-        for a in alert_history:
-            f.write(json.dumps(a) + "\n")
+def load_model_artifacts():
+    """Load model, scaler, feature columns, and threshold"""
+    print("[*] Loading model artifacts...")
+    
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(f"Model not found at {MODEL_PATH}. Run model.py first.")
+    if not os.path.exists(SCALER_PATH):
+        raise FileNotFoundError(f"Scaler not found at {SCALER_PATH}. Run model.py first.")
+    if not os.path.exists(FEAT_COLS_PATH):
+        raise FileNotFoundError(f"Feature columns not found at {FEAT_COLS_PATH}. Run features.py first.")
+    
+    model = joblib.load(MODEL_PATH)
+    scaler = joblib.load(SCALER_PATH)
+    feat_cols = joblib.load(FEAT_COLS_PATH)
+    
+    # Load threshold (from model training)
+    if os.path.exists(THRESHOLD_PATH):
+        with open(THRESHOLD_PATH, 'r') as f:
+            threshold = float(f.read().strip())
+        print(f"[i] Using saved threshold: {threshold:.4f}")
+    else:
+        # Fallback to percentile if threshold file missing
+        threshold = None
+        print("[w] No threshold file found, will use dynamic percentile")
+    
+    return model, scaler, feat_cols, threshold
 
 
-def extract_features(logs: list) -> dict:
-    """Mirror dionaea/features.py logic on raw ES log dicts."""
-    total = len(logs)
-
-    file_types = [l.get("file_type",        "unknown") for l in logs]
-    mime_types = [l.get("mime_type",        "unknown") for l in logs]
-    protocols  = [l.get("protocol",         "unknown") for l in logs]
-    signatures = [l.get("signature",        "unknown") for l in logs]
-    reporters  = [l.get("malware_reporter", "unknown") for l in logs]
-    vtpcts     = [float(l.get("vtpercent", 0) or 0)   for l in logs]
-
-    known_malware   = sum(1 for s in signatures if s and s != "unknown")
-    files_with_hash = sum(1 for l in logs if l.get("sha256_hash"))
-    exe_uploads     = sum(1 for t in file_types if t == "exe")
-    jar_uploads     = sum(1 for t in file_types if t == "jar")
-    rar_uploads     = sum(1 for t in file_types if t == "rar")
-    avg_vt          = sum(vtpcts) / len(vtpcts) if vtpcts else 0
-    max_vt          = max(vtpcts) if vtpcts else 0
-
-    malware_ratio       = known_malware   / (total + 1)
-    hash_ratio          = files_with_hash / (total + 1)
-    high_risk_uploads   = int(max_vt > 70)
-    suspicious_activity = malware_ratio + (avg_vt / 100)
-    exe_ratio           = exe_uploads / (total + 1)
-
-    # Time features
-    try:
-        ts_list = sorted(
-            datetime.fromisoformat(l["timestamp"].replace("Z", "+00:00"))
-            for l in logs if l.get("timestamp")
-        )
-        duration_min = max((ts_list[-1] - ts_list[0]).total_seconds() / 60, 1) if len(ts_list) > 1 else 1
-        upload_rate  = total / duration_min
-        gaps         = [(ts_list[i + 1] - ts_list[i]).total_seconds() for i in range(len(ts_list) - 1)]
-        burst_score  = 1 / (statistics.stdev(gaps) + 1) if len(gaps) > 1 else 0
-    except Exception:
-        upload_rate = total
-        burst_score = 0
-
-    return {
-        "total_uploads":       total,
-        "unique_file_types":   len(set(file_types)),
-        "unique_mime_types":   len(set(mime_types)),
-        "unique_protocols":    len(set(protocols)),
-        "unique_signatures":   len(set(signatures)),
-        "unique_reporters":    len(set(reporters)),
-        "avg_vtpercent":       round(avg_vt, 4),
-        "max_vtpercent":       round(max_vt, 4),
-        "known_malware":       known_malware,
-        "files_with_hash":     files_with_hash,
-        "exe_uploads":         exe_uploads,
-        "jar_uploads":         jar_uploads,
-        "rar_uploads":         rar_uploads,
-        "malware_ratio":       round(malware_ratio, 4),
-        "hash_ratio":          round(hash_ratio, 4),
-        "high_risk_uploads":   high_risk_uploads,
-        "suspicious_activity": round(suspicious_activity, 4),
-        "exe_ratio":           round(exe_ratio, 4),
-        "upload_rate":         round(upload_rate, 4),
-        "burst_score":         round(burst_score, 4),
-    }
-
-
-def predict_features(features: dict) -> tuple[str, float]:
-    X        = pd.DataFrame([features])[FEATURE_COLS].fillna(0)
+def predict():
+    """Run predictions on features data"""
+    
+    # Load artifacts
+    model, scaler, feat_cols, saved_threshold = load_model_artifacts()
+    
+    # Load features
+    print(f"[*] Loading features from: {FEATURES_CSV}")
+    if not os.path.exists(FEATURES_CSV):
+        raise FileNotFoundError(f"Features file not found at {FEATURES_CSV}. Run features.py first.")
+    
+    df = pd.read_csv(FEATURES_CSV)
+    print(f"[i] Loaded {len(df)} IP records")
+    
+    # Check for required columns
+    missing_cols = [col for col in feat_cols if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing feature columns in data: {missing_cols}")
+    
+    # Prepare features
+    X = df[feat_cols].fillna(0)
+    
+    # Scale features
+    print("[*] Scaling features...")
     X_scaled = scaler.transform(X)
-    score    = float(-model.score_samples(X_scaled)[0])
-    label    = "malicious" if score >= SCORE_THRESHOLD else "normal"
-    return label, round(score, 4)
+    
+    # Predict
+    print("[*] Running predictions...")
+    
+    # Get anomaly scores (higher = more suspicious)
+    anomaly_scores = -model.score_samples(X_scaled)
+    df["anomaly_score"] = anomaly_scores
+    
+    # Predict labels (-1 = anomaly/malicious, 1 = normal)
+    predictions = model.predict(X_scaled)
+    df["is_malicious_prediction"] = (predictions == -1).astype(int)
+    
+    # Determine threshold
+    if saved_threshold is not None:
+        THRESHOLD = saved_threshold
+    else:
+        # Dynamic threshold: 90th percentile of scores
+        THRESHOLD = df["anomaly_score"].quantile(0.90)
+        print(f"[i] Using dynamic threshold (90th percentile): {THRESHOLD:.4f}")
+    
+    # Define risk levels based on threshold and score
+    def get_risk_level(score):
+        if score >= THRESHOLD * 1.5:
+            return "critical"
+        elif score >= THRESHOLD * 1.2:
+            return "high"
+        elif score >= THRESHOLD:
+            return "medium"
+        elif score >= THRESHOLD * 0.5:
+            return "low"
+        else:
+            return "info"
+    
+    def get_threat_label(score):
+        if score >= THRESHOLD * 1.5:
+            return "critical_anomaly"
+        elif score >= THRESHOLD * 1.2:
+            return "high_risk_behavior"
+        elif score >= THRESHOLD:
+            return "suspicious_activity"
+        elif score >= THRESHOLD * 0.5:
+            return "low_risk_behavior"
+        else:
+            return "normal_behavior"
+    
+    df["risk_level"] = df["anomaly_score"].apply(get_risk_level)
+    df["threat_label"] = df["anomaly_score"].apply(get_threat_label)
+    
+    # Add confidence score (normalized between 0 and 1)
+    max_score = df["anomaly_score"].max()
+    min_score = df["anomaly_score"].min()
+    if max_score > min_score:
+        df["confidence"] = (df["anomaly_score"] - min_score) / (max_score - min_score)
+    else:
+        df["confidence"] = 0
+    
+    # Sort by most suspicious first
+    df = df.sort_values("anomaly_score", ascending=False)
+    
+    # Save results
+    df.to_csv(OUTPUT_CSV, index=False)
+    
+    # Summary
+    print(f"\n[✔] Predictions saved → {OUTPUT_CSV}")
+    print(f"\n{'='*50}")
+    print("PREDICTION SUMMARY")
+    print(f"{'='*50}")
+    print(f"Total IPs analyzed: {len(df)}")
+    print(f"Malicious predictions: {df['is_malicious_prediction'].sum()}")
+    print(f"Threshold used: {THRESHOLD:.4f}")
+    
+    print("\nRisk Level Distribution:")
+    risk_counts = df["risk_level"].value_counts()
+    for level in ["critical", "high", "medium", "low", "info"]:
+        count = risk_counts.get(level, 0)
+        pct = (count / len(df)) * 100
+        print(f"  {level:10s}: {count:4d} IPs ({pct:5.1f}%)")
+    
+    print("\nThreat Label Distribution:")
+    print(df["threat_label"].value_counts())
+    
+    # Show top 10 most suspicious IPs
+    print(f"\n{'='*50}")
+    print("TOP 10 MOST SUSPICIOUS IPs")
+    print(f"{'='*50}")
+    top_ips = df.head(10)[["source_ip", "anomaly_score", "risk_level", "threat_label", "total_uploads"]]
+    for idx, row in top_ips.iterrows():
+        print(f"  {row['source_ip']:20s} | score={row['anomaly_score']:.4f} | "
+              f"{row['risk_level']:8s} | {row['threat_label']:20s} | uploads={row['total_uploads']}")
+    
+    return df
 
 
-def fetch_new_logs() -> list:
-    global last_timestamp
-    query = (
-        {"range": {"timestamp": {"gt": last_timestamp}}}
-        if last_timestamp else {"match_all": {}}
-    )
-    res = es.search(
-        index=SOURCE_INDEX,
-        body={"size": 1000, "sort": [{"timestamp": "asc"}], "query": query},
-    )
-    return res["hits"]["hits"]
-
-
-def push_alert(src_ip: str, label: str, score: float, features: dict):
-    alert = {
-        "source_ip":     src_ip,
-        "honeypot":      "dionaea",
-        "prediction":    label,
-        "anomaly_score": score,
-        **features,
-        "@timestamp":    datetime.now(timezone.utc).isoformat(),
+def predict_single_ip(ip_address: str, features_df: pd.DataFrame = None):
+    """Predict for a single IP address"""
+    if features_df is None:
+        features_df = pd.read_csv(FEATURES_CSV)
+    
+    model, scaler, feat_cols, threshold = load_model_artifacts()
+    
+    ip_data = features_df[features_df["source_ip"] == ip_address]
+    if len(ip_data) == 0:
+        return {"error": f"IP {ip_address} not found in features data"}
+    
+    X = ip_data[feat_cols].fillna(0)
+    X_scaled = scaler.transform(X)
+    score = -model.score_samples(X_scaled)[0]
+    prediction = model.predict(X_scaled)[0]
+    
+    return {
+        "ip": ip_address,
+        "anomaly_score": float(score),
+        "is_malicious": bool(prediction == -1),
+        "risk_level": "critical" if score >= threshold * 1.5 else
+                     "high" if score >= threshold * 1.2 else
+                     "medium" if score >= threshold else
+                     "low" if score >= threshold * 0.5 else "info",
+        "threshold": float(threshold)
     }
-    es.index(index=TARGET_INDEX, document=alert)
-    save_alert(alert)
-
-
-def run():
-    global last_timestamp
-
-    hits = fetch_new_logs()
-    if not hits:
-        return
-
-    latest_ts: str | None = last_timestamp
-    seen_ips: set[str]    = set()
-
-    for hit in hits:
-        src = hit["_source"]
-        ip  = src.get("source_ip", "unknown")
-        ip_buffers[ip].append(src)
-        seen_ips.add(ip)
-        ts = src.get("timestamp")
-        if ts and (latest_ts is None or ts > latest_ts):
-            latest_ts = ts
-
-    for ip in seen_ips:
-        logs         = list(ip_buffers[ip])
-        features     = extract_features(logs)
-        label, score = predict_features(features)
-        push_alert(ip, label, score, features)
-
-        flag = "MALICIOUS" if label == "malicious" else "normal   "
-        print(
-            f"  [{flag}]  {ip:20s}  score={score:.4f}"
-            f"  uploads={features['total_uploads']} (window={len(logs)})"
-            f"  malware={features['known_malware']}"
-            f"  vt_max={features['max_vtpercent']:.1f}%"
-        )
-
-    last_timestamp = latest_ts
-    print(f"[->] {len(hits)} events | {len(seen_ips)} IPs | last_ts={last_timestamp}")
-
-
-def poll_loop():
-    print(f"[*] Dionaea predict loop  (poll every {POLL_SECONDS}s, window={WINDOW_SIZE} logs/IP)")
-    while True:
-        try:
-            run()
-        except Exception as e:
-            print(f"[!] Error: {e}")
-        time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
-    t = threading.Thread(target=poll_loop, daemon=True)
-    t.start()
-    print("[*] Predict loop running in background — terminal is free.")
-    print("[*] Press Ctrl+C to stop.")
-    try:
-        t.join()
-    except KeyboardInterrupt:
-        print("\n[*] Stopped.")
+    # Run full prediction
+    results = predict()
+    
+    # Example: Predict for a specific IP (uncomment to test)
+    # single_result = predict_single_ip("192.168.1.100")
+    # print(f"\nSingle IP prediction: {single_result}")

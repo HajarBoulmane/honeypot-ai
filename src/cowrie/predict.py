@@ -1,190 +1,73 @@
 """
-predict.py — Cowrie FINAL FIX (stable + correct scoring)
+predict.py — Cowrie
+Runs IsolationForest inference + labels
 """
 
 import os
-import time
 import joblib
 import pandas as pd
-from datetime import datetime, timezone
-from collections import defaultdict
-from elasticsearch import Elasticsearch
 
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
-ES_HOST = "http://localhost:9200"
-SOURCE_INDEX = "cowrie-logs"
-TARGET_INDEX = "cowrie-alerts"
-POLL_SECONDS = 5
+# PATHS
+FEATURES_CSV   = "data/cowrie/processed/cowrie_features.csv"
+OUTPUT_CSV     = "data/cowrie/predictions/cowrie_predictions.csv"
 
-MODEL_PATH = "models/cowrie_model.pkl"
-SCALER_PATH = "models/cowrie_scaler.pkl"
-FEATURES_PATH = "models/feature_columns.pkl"
+MODEL_PATH     = "models/cowrie/cowrie_model.pkl"
+SCALER_PATH    = "models/cowrie/cowrie_scaler.pkl"
+FEAT_COLS_PATH = "models/cowrie/feature_columns.pkl"
 
-es = Elasticsearch(ES_HOST)
+os.makedirs("data/cowrie/predictions", exist_ok=True)
 
-# ─────────────────────────────────────────────
 # LOAD MODEL
-# ─────────────────────────────────────────────
+print("[*] Loading model...")
+
 model = joblib.load(MODEL_PATH)
 scaler = joblib.load(SCALER_PATH)
-FEATURE_COLS = joblib.load(FEATURES_PATH)
+feat_cols = joblib.load(FEAT_COLS_PATH)
 
-# ─────────────────────────────────────────────
-# STATE
-# ─────────────────────────────────────────────
-last_ts = None
-ip_cmds = defaultdict(list)
+# LOAD DATA
+print("[*] Loading features...")
 
+df = pd.read_csv(FEATURES_CSV)
 
-# ─────────────────────────────────────────────
-# CLEAN COMMANDS
-# ─────────────────────────────────────────────
-def clean_list(lst):
-    return [
-        str(x).strip()
-        for x in lst
-        if x is not None and str(x).strip().lower() != "nan" and str(x).strip() != ""
-    ]
+X = df.reindex(columns=feat_cols, fill_value=0).fillna(0)
 
+# PREDICT
+print("[*] Running predictions...")
 
-# ─────────────────────────────────────────────
-# FETCH LOGS
-# ─────────────────────────────────────────────
-def fetch_logs():
-    global last_ts
+X_scaled = scaler.transform(X)
 
-    query = {"match_all": {}} if not last_ts else {
-        "range": {"timestamp": {"gt": last_ts}}
-    }
+# anomaly score (higher = more suspicious)
+df["anomaly_score"] = -model.score_samples(X_scaled)
 
-    res = es.search(
-        index=SOURCE_INDEX,
-        size=500,
-        sort=[{"timestamp": "asc"}],
-        query=query
-    )
+# dynamic threshold (IMPORTANT)
+THRESHOLD = df["anomaly_score"].quantile(0.90)
 
-    logs = [h["_source"] for h in res["hits"]["hits"]]
+# LABELS
+def assign_label(score):
+    if score >= 0.90:
+        return "critical_anomaly"
+    if score >= 0.75:
+        return "novel_behavior"
+    if score >= THRESHOLD:
+        return "suspicious_activity"
+    return "known_pattern"
 
-    if logs:
-        last_ts = logs[-1]["timestamp"]
+def assign_tier(score):
+    if score >= 0.90:
+        return "critical"
+    if score >= 0.75:
+        return "high"
+    if score >= THRESHOLD:
+        return "medium"
+    return "low"
 
-    return logs
+df["final_label"] = df["anomaly_score"].apply(assign_label)
+df["threat_tier"] = df["anomaly_score"].apply(assign_tier)
 
+# SAVE
+df.to_csv(OUTPUT_CSV, index=False)
 
-# ─────────────────────────────────────────────
-# BUILD FEATURES (IMPORTANT FIX HERE)
-# ─────────────────────────────────────────────
-def build_features(g, ip):
-
-    return {
-        "total_events": len(g),
-        "unique_sessions": g["session_id"].nunique(),
-
-        "failed_logins": (g["login_success"] == False).sum(),
-        "success_logins": (g["login_success"] == True).sum(),
-
-        "unique_usernames": g["username"].nunique(),
-        "unique_passwords": g["password"].nunique(),
-
-        "unique_dst_ports": g["dst_port"].nunique(),
-        "unique_protocols": g["protocol"].nunique(),
-
-        "commands_executed": len(ip_cmds[ip]),
-
-        "files_downloaded": (g["file_downloaded"] != "").sum(),
-        "c2_connections": (g["c2_ip"] != "").sum(),
-        "has_payload": g["sha256_payload"].notna().sum(),
-
-        "avg_session_duration": g["session_duration_sec"].mean(),
-
-        "total_bytes_sent": g["bytes_sent"].sum(),
-        "total_bytes_received": g["bytes_received"].sum(),
-
-        "high_severity_events": (g["severity"] == "high").sum(),
-        "medium_severity_events": (g["severity"] == "medium").sum(),
-
-        "unique_mitre_techniques": g["mitre_technique_id"].nunique(),
-        "unique_attack_types": g["attack_type"].nunique(),
-
-        "compromised_count": (g["alert_tag"] == "compromised_login").sum(),
-
-        # derived (same logic as training)
-        "fail_rate": (g["login_success"] == False).sum() / (len(g) + 1),
-        "success_rate": (g["login_success"] == True).sum() / (len(g) + 1),
-
-        "user_reuse_ratio": 1 - (g["username"].nunique() / ((g["login_success"] == False).sum() + 1)),
-
-        "cmd_per_session": len(ip_cmds[ip]) / (g["session_id"].nunique() + 1),
-
-        "bytes_ratio": g["bytes_sent"].sum() / (g["bytes_received"].sum() + 1),
-
-        "threat_score": (
-            (g["severity"] == "high").sum() * 2 +
-            (g["severity"] == "medium").sum()
-        ) / (len(g) + 1),
-
-        "connection_rate": len(g),
-        "burst_score": len(g) / (g["session_id"].nunique() + 1),
-    }
-
-
-# ─────────────────────────────────────────────
-# MAIN LOOP
-# ─────────────────────────────────────────────
-def run():
-
-    logs = fetch_logs()
-    if not logs:
-        return
-
-    df = pd.DataFrame(logs)
-
-    for ip, g in df.groupby("src_ip"):
-
-        # ── COMMAND CLEANING ──
-        for _, r in g.iterrows():
-            cmd = r.get("command")
-            if cmd:
-                ip_cmds[ip].append(cmd)
-
-        ip_cmds[ip] = clean_list(ip_cmds[ip])
-
-        # ── FEATURE BUILD ──
-        features = build_features(g, ip)
-
-        X = pd.DataFrame([features]).reindex(columns=FEATURE_COLS, fill_value=0)
-
-        Xs = scaler.transform(X)
-        score = float(-model.score_samples(Xs)[0])
-
-        label = "attacker" if score > 0.61 else "normal"
-
-        alert = {
-            "src_ip": ip,
-            "label": label,
-            "score": score,
-            "commands": ip_cmds[ip],
-            "unique_commands": len(set(ip_cmds[ip])),
-            "@timestamp": datetime.now(timezone.utc).isoformat()
-        }
-
-        es.index(index=TARGET_INDEX, document=alert)
-
-        print(f"{ip} → {label} {score:.4f}")
-
-
-# ─────────────────────────────────────────────
-# LOOP
-# ─────────────────────────────────────────────
-print("[*] Predicting SOC engine running...")
-
-while True:
-    try:
-        run()
-    except Exception as e:
-        print("[ERR]", e)
-
-    time.sleep(POLL_SECONDS)
+# SUMMARY
+print(f"\n[✔] Saved: {OUTPUT_CSV}")
+print(df["threat_tier"].value_counts())
+print(df["final_label"].value_counts())
