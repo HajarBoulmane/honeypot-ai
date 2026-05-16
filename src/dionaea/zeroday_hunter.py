@@ -1,99 +1,82 @@
 #!/usr/bin/env python3
-"""
-COMPLETE ZERO-DAY HUNTER
-Finds, analyzes, and reports zero-day malware candidates
-"""
-
-import os
-import subprocess
 import requests
+import os
 import pandas as pd
-from datetime import datetime
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
 
-VT_API_KEY = os.getenv("VT_API_KEY")
+API_KEY = os.getenv("VT_API_KEY")
+VT_URL = "https://www.virustotal.com/api/v3/files/"
 
-def find_new_hashes():
-    """Find hashes not yet checked"""
-    
-    # Get all hashes from raw data
-    df = pd.read_csv("data/dionaea/raw/dionaea_raw.csv")
-    all_hashes = set(df['sha256_hash'].dropna().unique())
-    all_hashes = {h for h in all_hashes if h != "" and len(str(h)) > 10}
-    
-    # Get already checked hashes
-    checked_file = "data/dionaea/processed/checked_hashes.txt"
-    checked = set()
-    
-    if os.path.exists(checked_file):
-        with open(checked_file, 'r') as f:
-            checked = set(line.strip() for line in f)
-    
-    new_hashes = all_hashes - checked
-    return list(new_hashes), checked
+# Use YOUR zeroday dataset
+ZERO_DAY_CSV = "data/dionaea/raw/zeroday_raw.csv"
 
-def check_vt_status(file_hash):
-    """Quick check if hash exists in VT"""
-    headers = {"x-apikey": VT_API_KEY}
-    url = f"https://www.virustotal.com/api/v3/files/{file_hash}"
+# Check if file exists
+if not os.path.exists(ZERO_DAY_CSV):
+    print(f"[!] File not found: {ZERO_DAY_CSV}")
+    print("    Please update the path to your zeroday dataset")
+    exit(1)
+
+# Load hashes from your zeroday dataset
+df = pd.read_csv(ZERO_DAY_CSV)
+hashes = df['sha256_hash'].dropna().unique()
+hashes = [h for h in hashes if h != "" and len(str(h)) > 10]
+
+print(f"[*] Loaded {len(hashes)} unique SHA256 hashes from zeroday dataset")
+print(f"[*] Checking {min(20, len(hashes))} hashes for zero-days...\n")
+
+zero_days = []
+known_malware = []
+
+for i, h in enumerate(hashes[:20]):
+    print(f"[{i+1}/20] {h[:32]}...", end=" ")
     
+    headers = {"x-apikey": API_KEY}
     try:
-        r = requests.get(url, headers=headers, timeout=30)
-        return r.status_code == 200
-    except:
-        return False
-
-def save_checked_hash(file_hash):
-    """Save hash to checked list"""
-    with open("data/dionaea/processed/checked_hashes.txt", "a") as f:
-        f.write(f"{file_hash}\n")
-
-def main():
-    print("=" * 60)
-    print("ZERO-DAY HUNTER")
-    print("=" * 60)
-    
-    new_hashes, checked = find_new_hashes()
-    
-    print(f"[*] Total hashes: {len(checked) + len(new_hashes)}")
-    print(f"[*] Already checked: {len(checked)}")
-    print(f"[*] New hashes to check: {len(new_hashes)}")
-    
-    if not new_hashes:
-        print("\n[✓] No new hashes! All have been checked.")
-        return
-    
-    zero_days = []
-    
-    print("\n[*] Checking new hashes against VirusTotal...\n")
-    
-    for i, h in enumerate(new_hashes[:10], 1):  # Check first 10
-        print(f"[{i}/10] {h[:32]}...", end=" ")
+        r = requests.get(f"{VT_URL}{h}", headers=headers, timeout=30)
         
-        found = check_vt_status(h)
-        save_checked_hash(h)
-        
-        if not found:
+        if r.status_code == 404:
             zero_days.append(h)
-            print("🔴 ZERO-DAY CANDIDATE!")
+            print("🔴 ZERO-DAY CANDIDATE! (Not in any database)")
+            
+        elif r.status_code == 200:
+            data = r.json()
+            stats = data.get('data', {}).get('attributes', {}).get('last_analysis_stats', {})
+            malicious = stats.get('malicious', 0)
+            total = sum(stats.values())
+            
+            if malicious == 0:
+                zero_days.append(h)
+                print(f"🟠 POSSIBLE ZERO-DAY (0/{total} detections)")
+            else:
+                known_malware.append(h)
+                print(f"✅ Known malware ({malicious}/{total} engines)")
         else:
-            print("✅ Known file")
+            print(f"❌ Error {r.status_code}")
+            
+    except Exception as e:
+        print(f"❌ Connection error: {e}")
     
-    # Results
-    print("\n" + "=" * 60)
-    if zero_days:
-        print(f"🔴 FOUND {len(zero_days)} ZERO-DAY CANDIDATES!")
-        print("=" * 60)
-        for h in zero_days:
-            print(f"\n  Hash: {h}")
-            print(f"  Action: Extract and submit to VirusTotal")
-    else:
-        print("✅ No zero-day candidates found in this batch")
-    
-    print(f"\n[*] Checked {len(new_hashes[:10])} new hashes")
-    print(f"[*] Total checked: {len(checked) + len(new_hashes[:10])}")
+    time.sleep(15)  # Rate limit (4 per minute)
 
-if __name__ == "__main__":
-    main()
+print("\n" + "=" * 60)
+print("ZERO-DAY DISCOVERY RESULTS")
+print("=" * 60)
+print(f"Total hashes checked: {len(hashes[:20])}")
+print(f"🔴 ZERO-DAY CANDIDATES: {len(zero_days)}")
+print(f"✅ Known malware: {len(known_malware)}")
+
+if zero_days:
+    print("\n🔴 ZERO-DAY CANDIDATE HASHES:")
+    for h in zero_days:
+        print(f"  {h}")
+    
+    # Save zero-day hashes to file
+    with open("data/dionaea/processed/zeroday_hashes.txt", "w") as f:
+        for h in zero_days:
+            f.write(f"{h}\n")
+    print(f"\n[✓] Saved to: data/dionaea/processed/zeroday_hashes.txt")
+else:
+    print("\n[✓] No zero-day candidates found. All malware is known!")
