@@ -1,4 +1,4 @@
-# Honeypot AI SOC (Cowrie + Dionaea + ELK)
+# Honeypot AI SOC (Cowrie + Dionaea + Elastic Search)
 
 Lightweight SOC pipeline for detecting attacks using honeypots and machine learning.
 
