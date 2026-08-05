@@ -1,38 +1,120 @@
-# Honeypot AI SOC (Cowrie + Dionaea + Elastic Search)
+# Honeypot-AI
 
-Lightweight SOC pipeline for detecting attacks using honeypots and machine learning.
+An AI-powered honeypot system designed to collect, monitor, and analyze malicious network activity. The project combines multiple honeypots with the Elastic Stack for centralized log analysis and applies machine learning to identify anomalous attack behavior.
 
-## 🚀 Stack
+## Overview
 
-* Cowrie (SSH honeypot)
-* Dionaea (malware honeypot)
-* Elasticsearch + Kibana (SIEM)
-* Python (feature engineering + ML)
+The system deploys network honeypots to attract attackers and capture their activities. Collected logs are forwarded to Elasticsearch through Filebeat, visualized with Kibana, and analyzed using an Isolation Forest model to detect suspicious behaviors automatically.
 
-## ⚙️ Features
+## Features
 
-* Real-time log ingestion (Elastic)
-* Per-IP behavioral analysis
-* Anomaly detection (Isolation Forest)
-* Alerts indexed to Kibana dashboards
+- Deployment of Cowrie and Dionaea honeypots
+- Centralized log collection with Filebeat
+- Elasticsearch for log indexing and storage
+- Kibana dashboards for attack visualization
+- Machine learning-based anomaly detection using Isolation Forest
+- Automated detection of abnormal attack patterns
+- Cloud deployment using AWS EC2
 
-## 📊 Dashboards
+## Architecture
 
-* Cowrie: SSH attacks, commands, brute force
-* Dionaea: malware uploads, VT scores, risk metrics
-
-## ▶️ Run
-
-```bash
-docker compose up -d
+```
+Internet
+      │
+      ▼
++----------------+
+| Honeypots      |
+| Cowrie         |
+| Dionaea        |
++----------------+
+        │
+        ▼
++----------------+
+| Filebeat       |
++----------------+
+        │
+        ▼
++----------------+
+| Elasticsearch  |
++----------------+
+        │
+        ▼
++----------------+
+| Kibana         |
++----------------+
+        │
+        ▼
++---------------------------+
+| Isolation Forest Model    |
+| Anomaly Detection         |
++---------------------------+
 ```
 
-## 📁 Structure
+## Technology Stack
 
-* `src/` → ML + pipelines
-* `docker/` → ELK stack
-* `dashboards/` → exported Kibana dashboards
+| Category | Technologies |
+|----------|--------------|
+| Programming | Python |
+| Honeypots | Cowrie, Dionaea |
+| Log Collection | Filebeat |
+| Data Storage | Elasticsearch |
+| Visualization | Kibana |
+| Machine Learning | Scikit-learn (Isolation Forest) |
+| Data Processing | Pandas, NumPy |
+| Cloud | AWS EC2 |
 
-## 👨‍💻 Author
+## Machine Learning Pipeline
 
-Hajar Boulmane
+1. Collect attack logs from deployed honeypots.
+2. Parse and preprocess the collected events.
+3. Extract relevant behavioral features.
+4. Normalize the dataset.
+5. Train an Isolation Forest model.
+6. Detect anomalous attack activities.
+7. Visualize detected events through Kibana dashboards.
+
+## Project Structure
+
+```
+honeypot-ai/
+├── data/
+├── notebooks/
+├── models/
+├── scripts/
+├── logs/
+├── requirements.txt
+└── README.md
+```
+
+## Getting Started
+
+### Clone the repository
+
+```bash
+git clone https://github.com/HajarBoulmane/honeypot-ai.git
+cd honeypot-ai
+```
+
+### Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### Run the analysis
+
+```bash
+python main.py
+```
+
+## Learning Objectives
+
+This project demonstrates practical experience with:
+
+- Cybersecurity monitoring
+- Honeypot deployment
+- Threat intelligence
+- Log aggregation and analysis
+- Machine learning for anomaly detection
+- ELK Stack
+- AWS cloud deployment
